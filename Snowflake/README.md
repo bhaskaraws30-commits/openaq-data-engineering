@@ -155,7 +155,7 @@ Read-only business queries for analysts (not part of automated pipeline).
 
 | File | Description |
 |------|-------------|
-| `Untitled.sql` | Complete deployment script — run once to set up the automated pipeline |
+| `OpenAQ Air Quality Data Mart.sql` | Complete deployment script — run once to set up the automated pipeline |
 | `README.md` | This file |
 
 ## Prerequisites
@@ -166,7 +166,7 @@ Read-only business queries for analysts (not part of automated pipeline).
 
 ## How to Deploy
 
-1. Open `Untitled.sql` in a Snowflake Worksheet
+1. Open `OpenAQ Air Quality Data Mart.sql` in a Snowflake Worksheet
 2. Execute all statements top-to-bottom (one-time deployment)
 3. Configure AWS Glue to write to `OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS`
 4. Pipeline runs automatically from that point — no further manual intervention
