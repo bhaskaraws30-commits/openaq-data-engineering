@@ -1,5 +1,5 @@
--- OpenAQ Air Quality Data Mart: Production-grade DDL, ETL procedures, tasks, and analytic queries
--- Co-authored with CoCo
+-- OpenAQ Air Quality Data Mart: ELT approach - AWS Glue extracts/loads raw S3 data, all transformations in Snowflake
+
 
 -- ============================================================
 -- STEP 1: CREATE DATABASE AND SCHEMAS
@@ -9,7 +9,7 @@ CREATE OR REPLACE DATABASE OPENAQ;
 USE DATABASE OPENAQ;
 
 CREATE OR REPLACE SCHEMA RAW
-    COMMENT = 'Raw ingestion layer for OpenAQ data';
+    COMMENT = 'Raw ingestion layer - AWS Glue extracts from S3 and loads as-is (no transformation)';
 
 CREATE OR REPLACE SCHEMA STAGING
     COMMENT = 'Cleaned and validated data';
@@ -24,26 +24,15 @@ CREATE OR REPLACE SCHEMA ETL
     COMMENT = 'Stored procedures and pipeline orchestration';
 
 -- ============================================================
--- STEP 2: CREATE RAW TABLE (TB-SCALE WITH CLUSTERING + MULTI-SOURCE)
+-- STEP 2: RAW TABLE (Dynamically created by AWS Glue)
 -- ============================================================
-USE SCHEMA OPENAQ.RAW;
-
-CREATE OR REPLACE TABLE AIR_QUALITY_MEASUREMENTS (
-    location_id     INTEGER,
-    sensors_id      INTEGER,
-    location        VARCHAR(500),
-    datetime        TIMESTAMP_TZ,
-    lat             FLOAT,
-    lon             FLOAT,
-    parameter       VARCHAR(50),
-    units           VARCHAR(50),
-    value           FLOAT,
-    source_name     VARCHAR(200) DEFAULT 'openaq_s3',
-    source_file     VARCHAR(1000),
-    ingested_at     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-)
-CLUSTER BY (DATE_TRUNC('month', datetime), parameter)
-COMMENT = 'Raw air quality measurements - clustered for TB-scale query performance';
+-- The RAW.AIR_QUALITY_MEASUREMENTS table is created/managed by the AWS Glue job.
+-- Glue determines the schema dynamically from the S3 source files.
+-- Columns may be added or removed between Glue runs.
+-- DO NOT create or alter this table manually - Glue owns the DDL.
+--
+-- Expected columns from Glue (may vary):
+--   location_id, sensors_id, location, datetime, lat, lon, parameter, units, value
 
 -- ETL execution log for pipeline observability
 CREATE OR REPLACE TABLE OPENAQ.ETL.PIPELINE_LOG (
@@ -58,55 +47,7 @@ CREATE OR REPLACE TABLE OPENAQ.ETL.PIPELINE_LOG (
 COMMENT = 'ETL pipeline execution audit log';
 
 -- ============================================================
--- STEP 3: CREATE FILE FORMATS AND STAGES
--- ============================================================
-CREATE OR REPLACE FILE FORMAT OPENAQ.RAW.CSV_FORMAT
-    TYPE = 'CSV'
-    FIELD_DELIMITER = ','
-    SKIP_HEADER = 1
-    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-    NULL_IF = ('', 'NA', 'null')
-    EMPTY_FIELD_AS_NULL = TRUE
-    ENCODING = 'UTF8';
-
-CREATE OR REPLACE FILE FORMAT OPENAQ.RAW.CSV_GZ_FORMAT
-    TYPE = 'CSV'
-    FIELD_DELIMITER = ','
-    SKIP_HEADER = 1
-    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-    NULL_IF = ('', 'NA', 'null')
-    EMPTY_FIELD_AS_NULL = TRUE
-    COMPRESSION = 'GZIP'
-    ENCODING = 'UTF8';
-
--- External stage pointing to OpenAQ S3 public bucket (TB-scale historical data)
-CREATE OR REPLACE STAGE OPENAQ.RAW.OPENAQ_S3_STAGE
-    URL = 's3://openaq-fetches/'
-    FILE_FORMAT = OPENAQ.RAW.CSV_GZ_FORMAT;
-
--- Internal stage for local file uploads
-CREATE OR REPLACE STAGE OPENAQ.RAW.INTERNAL_STAGE
-    FILE_FORMAT = OPENAQ.RAW.CSV_FORMAT;
-
--- ============================================================
--- STEP 4: LOAD SAMPLE DATA FROM WORKSPACE CSV
--- ============================================================
-COPY FILES INTO @OPENAQ.RAW.INTERNAL_STAGE
-FROM 'snow://workspace/USER$.PUBLIC.DEFAULT$/versions/live'
-FILES=('location-2178-20220503.csv');
-
-COPY INTO OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS (
-    location_id, sensors_id, location, datetime, lat, lon, parameter, units, value
-)
-FROM @OPENAQ.RAW.INTERNAL_STAGE/location-2178-20220503.csv
-FILE_FORMAT = (FORMAT_NAME = OPENAQ.RAW.CSV_FORMAT)
-ON_ERROR = 'CONTINUE';
-
--- Verify load
-SELECT COUNT(*) AS raw_record_count FROM OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS;
-
--- ============================================================
--- STEP 5: DATA QUALITY - REJECTED RECORDS TABLE
+-- STEP 3: DATA QUALITY - REJECTED RECORDS TABLE
 -- ============================================================
 USE SCHEMA OPENAQ.DATA_QUALITY;
 
@@ -121,14 +62,13 @@ CREATE OR REPLACE TABLE REJECTED_RECORDS (
     units            VARCHAR(50),
     value            FLOAT,
     rejection_reason VARCHAR(200),
-    source_name      VARCHAR(200),
     rejected_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 )
 CLUSTER BY (rejection_reason, parameter)
 COMMENT = 'Records excluded from the data mart due to quality issues';
 
 -- ============================================================
--- STEP 6: STAGING - CLEAN DATA TABLE DEFINITION
+-- STEP 4: STAGING - CLEAN DATA TABLE DEFINITION
 -- ============================================================
 USE SCHEMA OPENAQ.STAGING;
 
@@ -152,11 +92,11 @@ CLUSTER BY (measurement_date, parameter, city)
 COMMENT = 'Cleaned and interpolated air quality data - clustered for TB-scale joins';
 
 -- ============================================================
--- STEP 7: DATA MART - DYNAMIC TABLES (AUTO-REFRESH)
+-- STEP 5: DATA MART - DYNAMIC TABLES (AUTO-REFRESH)
 -- ============================================================
 USE SCHEMA OPENAQ.MART;
 
--- 7A: Monthly City Pollution (auto-refreshes from staging)
+-- 6A: Monthly City Pollution (auto-refreshes from staging)
 CREATE OR REPLACE DYNAMIC TABLE MONTHLY_CITY_POLLUTION
     TARGET_LAG = '1 hour'
     WAREHOUSE = COMPUTE_WH
@@ -175,7 +115,7 @@ FROM OPENAQ.STAGING.AIR_QUALITY_CLEAN
 WHERE parameter IN ('co', 'so2')
 GROUP BY city, location, measurement_month, parameter, units;
 
--- 7B: Daily City PM2.5 (auto-refreshes from staging)
+-- 6B: Daily City PM2.5 (auto-refreshes from staging)
 CREATE OR REPLACE DYNAMIC TABLE DAILY_CITY_PM25
     TARGET_LAG = '1 hour'
     WAREHOUSE = COMPUTE_WH
@@ -192,7 +132,7 @@ FROM OPENAQ.STAGING.AIR_QUALITY_CLEAN
 WHERE parameter = 'pm25'
 GROUP BY city, location, measurement_date;
 
--- 7C: Hourly City Pollution (auto-refreshes from staging)
+-- 6C: Hourly City Pollution (auto-refreshes from staging)
 CREATE OR REPLACE DYNAMIC TABLE HOURLY_CITY_POLLUTION
     TARGET_LAG = '1 hour'
     WAREHOUSE = COMPUTE_WH
@@ -210,7 +150,7 @@ FROM OPENAQ.STAGING.AIR_QUALITY_CLEAN
 WHERE parameter IN ('pm25', 'co', 'so2')
 GROUP BY city, location, measurement_date, measurement_hour, parameter, units;
 
--- 7D: Country Air Quality Index (auto-refreshes from staging)
+-- 6D: Country Air Quality Index (auto-refreshes from staging)
 CREATE OR REPLACE DYNAMIC TABLE COUNTRY_AIR_QUALITY_INDEX
     TARGET_LAG = '1 hour'
     WAREHOUSE = COMPUTE_WH
@@ -260,11 +200,11 @@ SELECT
 FROM scored;
 
 -- ============================================================
--- STEP 8: STORED PROCEDURES (PRODUCTION ETL PIPELINE)
+-- STEP 6: STORED PROCEDURES (PRODUCTION ETL PIPELINE)
 -- ============================================================
 USE SCHEMA OPENAQ.ETL;
 
--- 8A: Data Quality Procedure - identifies and logs rejected records
+-- 7A: Data Quality Procedure - identifies and logs rejected records
 CREATE OR REPLACE PROCEDURE OPENAQ.ETL.SP_RUN_DATA_QUALITY(P_RUN_ID VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -279,7 +219,7 @@ BEGIN
 
     -- Reject NULLs in critical fields
     INSERT INTO OPENAQ.DATA_QUALITY.REJECTED_RECORDS
-        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason, source_name)
+        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason)
     SELECT location_id, sensors_id, location, datetime, lat, lon, parameter, units, value,
         CASE
             WHEN value IS NULL THEN 'NULL measurement value'
@@ -287,8 +227,7 @@ BEGIN
             WHEN location IS NULL OR location = '' THEN 'NULL or empty location'
             WHEN parameter IS NULL OR parameter = '' THEN 'NULL or empty parameter'
             WHEN lat IS NULL OR lon IS NULL THEN 'NULL coordinates'
-        END,
-        source_name
+        END
     FROM OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS
     WHERE value IS NULL
        OR datetime IS NULL
@@ -300,9 +239,9 @@ BEGIN
 
     -- Reject negative values
     INSERT INTO OPENAQ.DATA_QUALITY.REJECTED_RECORDS
-        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason, source_name)
+        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason)
     SELECT location_id, sensors_id, location, datetime, lat, lon, parameter, units, value,
-        'Negative measurement value', source_name
+        'Negative measurement value'
     FROM OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS
     WHERE value < 0;
 
@@ -310,9 +249,9 @@ BEGIN
 
     -- Reject extreme outliers (>5 std dev)
     INSERT INTO OPENAQ.DATA_QUALITY.REJECTED_RECORDS
-        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason, source_name)
+        (location_id, sensors_id, location, datetime, lat, lon, parameter, units, value, rejection_reason)
     SELECT r.location_id, r.sensors_id, r.location, r.datetime, r.lat, r.lon, r.parameter, r.units, r.value,
-        'Extreme outlier (>5 std dev from mean)', r.source_name
+        'Extreme outlier (>5 std dev from mean)'
     FROM OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS r
     JOIN (
         SELECT parameter, AVG(value) AS avg_val, STDDEV(value) AS std_val
@@ -338,7 +277,7 @@ EXCEPTION
         RETURN 'FAILED: ' || SQLERRM;
 END;
 
--- 8B: Staging Refresh Procedure - rebuilds clean data with interpolation
+-- 7B: Staging Refresh Procedure - rebuilds clean data with interpolation
 CREATE OR REPLACE PROCEDURE OPENAQ.ETL.SP_REFRESH_STAGING(P_RUN_ID VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -402,46 +341,7 @@ EXCEPTION
         RETURN 'FAILED: ' || SQLERRM;
 END;
 
--- 8C: Incremental Load Procedure - loads new data from S3 by year/month pattern
-CREATE OR REPLACE PROCEDURE OPENAQ.ETL.SP_LOAD_FROM_S3(P_RUN_ID VARCHAR, P_YEAR VARCHAR, P_MONTH VARCHAR)
-RETURNS VARCHAR
-LANGUAGE SQL
-AS
-BEGIN
-    LET v_start TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
-    LET v_pattern VARCHAR := '.*locationId=.*/' || P_YEAR || '/' || P_MONTH || '/.*\\.csv\\.gz';
-
-    COPY INTO OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS (
-        location_id, sensors_id, location, datetime, lat, lon, parameter, units, value
-    )
-    FROM @OPENAQ.RAW.OPENAQ_S3_STAGE/records/csv.gz/
-    PATTERN = :v_pattern
-    FILE_FORMAT = (FORMAT_NAME = OPENAQ.RAW.CSV_GZ_FORMAT)
-    ON_ERROR = 'CONTINUE';
-
-    LET v_rows INTEGER := SQLROWCOUNT;
-
-    -- Update source tracking
-    UPDATE OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS
-    SET source_name = 'openaq_s3_' || :P_YEAR || '_' || :P_MONTH
-    WHERE source_name = 'openaq_s3'
-      AND source_file IS NULL
-      AND ingested_at >= :v_start;
-
-    -- Log execution
-    INSERT INTO OPENAQ.ETL.PIPELINE_LOG (run_id, step_name, status, rows_affected, started_at, completed_at)
-    VALUES (:P_RUN_ID, 'S3_LOAD_' || :P_YEAR || '_' || :P_MONTH, 'SUCCESS', :v_rows, :v_start, CURRENT_TIMESTAMP());
-
-    RETURN 'S3 load complete for ' || :P_YEAR || '-' || :P_MONTH || '. Rows loaded: ' || :v_rows::VARCHAR;
-
-EXCEPTION
-    WHEN OTHER THEN
-        INSERT INTO OPENAQ.ETL.PIPELINE_LOG (run_id, step_name, status, error_message, started_at, completed_at)
-        VALUES (:P_RUN_ID, 'S3_LOAD_' || :P_YEAR || '_' || :P_MONTH, 'FAILED', SQLERRM, :v_start, CURRENT_TIMESTAMP());
-        RETURN 'FAILED: ' || SQLERRM;
-END;
-
--- 8D: Master Orchestrator Procedure - runs the full pipeline
+-- 7C: Master Orchestrator Procedure - runs the full pipeline
 CREATE OR REPLACE PROCEDURE OPENAQ.ETL.SP_RUN_FULL_PIPELINE()
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -468,14 +368,30 @@ BEGIN
 END;
 
 -- ============================================================
--- STEP 9: TASK-BASED SCHEDULING (AUTOMATED REFRESH)
+-- STEP 7: STREAM + TASK (AUTO-PROCESS WHEN GLUE LOADS NEW DATA)
 -- ============================================================
+-- Stream tracks new rows inserted by AWS Glue into the raw table.
+-- Task triggers the ETL pipeline ONLY when new data arrives (event-driven).
 
--- Root task: runs the full pipeline every 6 hours
+CREATE OR REPLACE STREAM OPENAQ.RAW.STREAM_RAW_NEW_DATA
+    ON TABLE OPENAQ.RAW.AIR_QUALITY_MEASUREMENTS
+    APPEND_ONLY = TRUE
+    COMMENT = 'Tracks new rows loaded by AWS Glue';
+
+-- Task fires when stream has data (new records from Glue)
+CREATE OR REPLACE TASK OPENAQ.ETL.TASK_PROCESS_NEW_DATA
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = '5 MINUTE'
+    COMMENT = 'Processes new Glue-loaded data: raw -> data quality -> staging -> mart (via dynamic tables)'
+    WHEN SYSTEM$STREAM_HAS_DATA('OPENAQ.RAW.STREAM_RAW_NEW_DATA')
+AS
+    CALL OPENAQ.ETL.SP_RUN_FULL_PIPELINE();
+
+-- Scheduled full pipeline (fallback: runs every 6 hours regardless of stream)
 CREATE OR REPLACE TASK OPENAQ.ETL.TASK_FULL_PIPELINE
     WAREHOUSE = COMPUTE_WH
     SCHEDULE = 'USING CRON 0 */6 * * * America/Denver'
-    COMMENT = 'Runs full ETL pipeline every 6 hours'
+    COMMENT = 'Scheduled full ETL pipeline every 6 hours (fallback/catch-up)'
 AS
     CALL OPENAQ.ETL.SP_RUN_FULL_PIPELINE();
 
@@ -496,26 +412,22 @@ AS
     FROM OPENAQ.ETL.PIPELINE_LOG
     WHERE started_at >= DATEADD('hour', -6, CURRENT_TIMESTAMP());
 
--- Enable tasks (uncomment to activate in production)
--- ALTER TASK OPENAQ.ETL.TASK_FULL_PIPELINE RESUME;
--- ALTER TASK OPENAQ.ETL.TASK_MONITOR_PIPELINE RESUME;
+-- Enable all tasks for fully automated pipeline (no manual runs)
+ALTER TASK OPENAQ.ETL.TASK_MONITOR_PIPELINE RESUME;
+ALTER TASK OPENAQ.ETL.TASK_FULL_PIPELINE RESUME;
+ALTER TASK OPENAQ.ETL.TASK_PROCESS_NEW_DATA RESUME;
 
 -- ============================================================
--- STEP 10: RUN THE PIPELINE (INITIAL EXECUTION)
+-- STEP 8: VERIFY AUTOMATION STATUS
 -- ============================================================
-CALL OPENAQ.ETL.SP_RUN_FULL_PIPELINE();
+-- Confirm all tasks are running:
+SHOW TASKS IN SCHEMA OPENAQ.ETL;
 
--- Verify pipeline execution log
-SELECT * FROM OPENAQ.ETL.PIPELINE_LOG ORDER BY started_at DESC;
-
--- Verify dynamic table refresh status
-SELECT name, scheduling_state, last_completed_time
-FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
-WHERE name IN ('MONTHLY_CITY_POLLUTION', 'DAILY_CITY_PM25', 'HOURLY_CITY_POLLUTION', 'COUNTRY_AIR_QUALITY_INDEX')
-ORDER BY last_completed_time DESC;
+-- Verify dynamic table refresh status:
+SHOW DYNAMIC TABLES IN SCHEMA OPENAQ.MART;
 
 -- ============================================================
--- STEP 11: ANALYTIC QUERIES (Business Requirements)
+-- STEP 9: ANALYTIC QUERIES (Business Requirements)
 -- ============================================================
 
 -- QUERY 1: For any given month, find all cities with average monthly
@@ -610,7 +522,7 @@ WHERE measurement_date = '2022-05-03'::DATE
 ORDER BY aqi_score DESC;
 
 -- ============================================================
--- STEP 12: DATA QUALITY REPORTING
+-- STEP 10: DATA QUALITY REPORTING
 -- ============================================================
 SELECT
     rejection_reason,
@@ -622,22 +534,3 @@ SELECT
 FROM OPENAQ.DATA_QUALITY.REJECTED_RECORDS
 GROUP BY rejection_reason, parameter
 ORDER BY rejected_count DESC;
-
--- ============================================================
--- STEP 13: TB-SCALE HISTORICAL LOAD (2017 full year example)
--- ============================================================
--- Load all 12 months of 2017 data from OpenAQ S3
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '01');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '02');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '03');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '04');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '05');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '06');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '07');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '08');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '09');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '10');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '11');
--- CALL OPENAQ.ETL.SP_LOAD_FROM_S3('HISTORICAL_2017', '2017', '12');
--- After loading, run the full pipeline:
--- CALL OPENAQ.ETL.SP_RUN_FULL_PIPELINE();
