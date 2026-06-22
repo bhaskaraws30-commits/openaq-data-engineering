@@ -1,5 +1,5 @@
 /*
-Dynamic Schema Evolution Pipeline: S3 → AWS Glue → Snowflake with Automatic Table Creation and Audit Tracking
+ Dynamic Schema Evolution Pipeline: S3 → AWS Glue → Snowflake with Automatic Table Creation and Audit Tracking
 High-Level Description
 
 Developed a metadata-driven AWS Glue PySpark ETL pipeline that reads data from the Glue Catalog, automatically handles schema changes (column additions/removals), generates Snowflake DDL dynamically, enriches data with audit columns, and loads the transformed data into Snowflake for scalable analytics.
